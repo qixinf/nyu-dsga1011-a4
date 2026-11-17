@@ -37,17 +37,16 @@ def do_train(args, model, train_dataloader, save_dir="./out"):
     model.train()
     progress_bar = tqdm(range(num_training_steps))
 
-    ################################
-    ##### YOUR CODE BEGINGS HERE ###
-
-    # Implement the training loop --- make sure to use the optimizer and lr_sceduler (learning rate scheduler)
-    # Remember that pytorch uses gradient accumumlation so you need to use zero_grad (https://pytorch.org/tutorials/recipes/recipes/zeroing_out_gradients.html)
-    # You can use progress_bar.update(1) to see the progress during training
-    # You can refer to the pytorch tutorial covered in class for reference
-
-    raise NotImplementedError
-
-    ##### YOUR CODE ENDS HERE ######
+    for _ in range(num_epochs):
+        for batch in train_dataloader:
+            batch = {key: value.to(device) for key, value in batch.items()}
+            optimizer.zero_grad()
+            loss = model(**batch).loss
+            loss.backward()
+            optimizer.step()
+            lr_scheduler.step()
+            progress_bar.update(1)
+    progress_bar.close()
 
     print("Training completed...")
     print("Saving Model....")
@@ -83,21 +82,15 @@ def do_eval(eval_dataloader, output_dir, out_file):
 
     return score
 
-
 # Created a dataladoer for the augmented training dataset
 def create_augmented_dataloader(args, dataset):
-    ################################
-    ##### YOUR CODE BEGINGS HERE ###
-
-    # Here, 'dataset' is the original dataset. You should return a dataloader called 'train_dataloader' -- this
-    # dataloader will be for the original training split augmented with 5k random transformed examples from the training set.
-    # You may find it helpful to see how the dataloader was created at other place in this code.
-
-    raise NotImplementedError
-
-    ##### YOUR CODE ENDS HERE ######
-
-    return train_dataloader
+    train = dataset["train"]
+    selected = train.shuffle(seed=42).select(range(5000))
+    transformed = selected.map(custom_transform, load_from_cache_file=False)
+    augmented = datasets.concatenate_datasets([train, transformed])
+    encoded = augmented.map(tokenize_function, batched=True, remove_columns=["text"])
+    encoded = encoded.rename_column("label", "labels").with_format("torch")
+    return DataLoader(encoded, batch_size=args.batch_size, shuffle=True)
 
 
 # Create a dataloader for the transformed test set

@@ -9,6 +9,7 @@ import torch
 from tqdm.auto import tqdm
 import evaluate
 import random
+import re
 import argparse
 from nltk.corpus import wordnet
 from nltk import word_tokenize
@@ -34,18 +35,22 @@ def example_transform(example):
 # You can randomly select each word with some fixed probability to replace by a synonym.
 
 
+_VOWEL_NEIGHBORS = {"a": "s", "e": "wr", "i": "uo", "o": "ip", "u": "yi"}
+
+
 def custom_transform(example):
-    ################################
-    ##### YOUR CODE BEGINGS HERE ###
+    def mistype_word(match):
+        word = match.group()
+        positions = [i for i in range(1, len(word) - 1)
+                     if word[i].lower() in _VOWEL_NEIGHBORS]
+        if not positions or random.random() >= 0.20:
+            return word
 
-    # Design and implement the transformation as mentioned in pdf
-    # You are free to implement any transformation but the comments at the top roughly describe
-    # how you could implement two of them --- synonym replacement and typos.
+        i = random.choice(positions)
+        replacement = random.choice(_VOWEL_NEIGHBORS[word[i].lower()])
+        if word[i].isupper():
+            replacement = replacement.upper()
+        return word[:i] + replacement + word[i + 1:]
 
-    # You should update example["text"] using your transformation
-
-    raise NotImplementedError
-
-    ##### YOUR CODE ENDS HERE ######
-
+    example["text"] = re.sub(r"[A-Za-z]{4,}", mistype_word, example["text"])
     return example
