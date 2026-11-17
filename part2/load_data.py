@@ -1,17 +1,18 @@
-import os, random, re, string
-from collections import Counter
-from tqdm import tqdm
-import pickle
+from functools import lru_cache
+from pathlib import Path
 
+import torch
 from torch.utils.data import Dataset, DataLoader
 from torch.nn.utils.rnn import pad_sequence
 
-import nltk
-nltk.download('punkt')
 from transformers import T5TokenizerFast
-import torch
 
 PAD_IDX = 0
+
+@lru_cache(maxsize=1)
+def get_tokenizer():
+    return T5TokenizerFast.from_pretrained("google-t5/t5-small")
+
 
 class T5Dataset(Dataset):
 
@@ -26,17 +27,27 @@ class T5Dataset(Dataset):
               T5Tokenizer should serve that purpose.
             * Class behavior should be different on the test set.
         '''
-        # TODO
+        self.inputs, self.targets = self.process_data(data_folder, split, get_tokenizer())
 
     def process_data(self, data_folder, split, tokenizer):
-        # TODO
+        folder = Path(data_folder)
+        questions = load_lines(folder / f"{split}.nl")
+        inputs = tokenizer(questions, max_length=128, truncation=True).input_ids
+        if split == "test":
+            return inputs, None
+        queries = load_lines(folder / f"{split}.sql")
+        if len(queries) != len(questions):
+            raise ValueError(f"Mismatched question and SQL counts for {split}")
+        targets = tokenizer(queries, max_length=512, truncation=True).input_ids
+        return inputs, targets
     
     def __len__(self):
-        # TODO
+        return len(self.inputs)
 
     def __getitem__(self, idx):
-        # TODO
-
+        target = None if self.targets is None else torch.tensor(self.targets[idx])
+        return torch.tensor(self.inputs[idx]), target
+    
 def normal_collate_fn(batch):
     '''
     Collation function to perform dynamic padding for training and evaluation with the
@@ -53,8 +64,10 @@ def normal_collate_fn(batch):
         * decoder_targets: The target tokens with which to train the decoder (the tokens following each decoder input)
         * initial_decoder_inputs: The very first input token to be decoder (only to be used in evaluation)
     '''
-    # TODO
-    return [], [], [], [], []
+    encoder_ids, encoder_mask, initial_decoder_inputs = test_collate_fn(batch)
+    decoder_targets = pad_sequence([target for _, target in batch], batch_first=True, padding_value=PAD_IDX)
+    decoder_inputs = torch.cat((initial_decoder_inputs, decoder_targets[:, :-1]), dim=1)
+    return encoder_ids, encoder_mask, decoder_inputs, decoder_targets, initial_decoder_inputs
 
 def test_collate_fn(batch):
     '''
@@ -69,8 +82,12 @@ def test_collate_fn(batch):
         * encoder_mask: Mask of shape BxT associated with padding tokens in the encoder input
         * initial_decoder_inputs: The very first input token to be decoder (only to be used in evaluation)
     '''
-    # TODO
-    return [], [], []
+    encoder_ids = pad_sequence([source for source, _ in batch], batch_first=True, padding_value=PAD_IDX)
+    encoder_mask = encoder_ids.ne(PAD_IDX)
+    # Pretrained T5 uses its pad token as the decoder start token.
+    initial_decoder_inputs = encoder_ids.new_full((len(batch), 1), PAD_IDX)
+    return encoder_ids, encoder_mask, initial_decoder_inputs
+
 
 def get_dataloader(batch_size, split):
     data_folder = 'data'
@@ -98,3 +115,43 @@ def load_lines(path):
 def load_prompting_data(data_folder):
     # TODO
     return train_x, train_y, dev_x, dev_y, test_x
+
+def token_statistics(lines, tokenizer):
+    """Count text tokens before padding, truncation, or model-specific special tokens."""
+    encoded = tokenizer(lines, add_special_tokens=False, padding=False,
+                        truncation=False, return_attention_mask=False)
+    sequences = encoded["input_ids"]
+    vocabulary = {token for sequence in sequences for token in sequence}
+    return sum(map(len, sequences)) / len(lines), len(vocabulary)
+
+
+def print_q4_statistics():
+    data_dir = Path(__file__).resolve().parent / "data"
+    tokenizer = T5TokenizerFast.from_pretrained("google-t5/t5-small")
+    columns = []
+    for split in ("train", "dev"):
+        questions = load_lines(data_dir / f"{split}.nl")
+        queries = load_lines(data_dir / f"{split}.sql")
+        if not questions or len(questions) != len(queries):
+            raise ValueError(f"Expected nonempty paired NL and SQL files for {split}")
+        nl_mean, nl_vocab = token_statistics(questions, tokenizer)
+        sql_mean, sql_vocab = token_statistics(queries, tokenizer)
+        columns.append((len(questions), f"{nl_mean:.2f}", f"{sql_mean:.2f}", nl_vocab, sql_vocab))
+
+    labels = ("Number of examples", "Mean sentence length", "Mean SQL query length",
+              "Vocabulary size (natural language)", "Vocabulary size (SQL)")
+    rows = list(zip(labels, *columns))
+    # The baseline uses the original text with no additional preprocessing.
+    for title, table_rows in (("Table 1: Before preprocessing", rows),
+                              ("Table 2: After preprocessing (no additional changes)", rows[1:])):
+        print(title)
+        print("| Statistic | Train | Dev |")
+        print("|---|---:|---:|")
+        for label, train, dev in table_rows:
+            print(f"| {label} | {train} | {dev} |")
+        print()
+
+
+if __name__ == "__main__":
+    print_q4_statistics()
+    raise SystemExit(0)

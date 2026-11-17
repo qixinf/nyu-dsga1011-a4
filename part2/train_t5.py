@@ -5,10 +5,9 @@ from tqdm import tqdm
 import torch
 import torch.nn as nn
 import numpy as np
-import wandb
 
 from t5_utils import initialize_model, initialize_optimizer_and_scheduler, save_model, load_model_from_checkpoint, setup_wandb
-from transformers import GenerationConfig
+from load_data import get_tokenizer
 from load_data import load_t5_data
 from utils import compute_metrics, save_queries_and_records
 
@@ -27,16 +26,16 @@ def get_args():
     # Training hyperparameters
     parser.add_argument('--optimizer_type', type=str, default="AdamW", choices=["AdamW"],
                         help="What optimizer to use")
-    parser.add_argument('--learning_rate', type=float, default=1e-1)
+    parser.add_argument('--learning_rate', type=float, default=3e-4)
     parser.add_argument('--weight_decay', type=float, default=0)
 
     parser.add_argument('--scheduler_type', type=str, default="cosine", choices=["none", "cosine", "linear"],
                         help="Whether to use a LR scheduler and what type to use if so")
     parser.add_argument('--num_warmup_epochs', type=int, default=0,
                         help="How many epochs to warm up the learning rate for if using a scheduler")
-    parser.add_argument('--max_n_epochs', type=int, default=0,
+    parser.add_argument('--max_n_epochs', type=int, default=15,
                         help="How many epochs to train the model for")
-    parser.add_argument('--patience_epochs', type=int, default=0,
+    parser.add_argument('--patience_epochs', type=int, default=3,
                         help="If validation performance stops improving, how many epochs should we wait before stopping?")
 
     parser.add_argument('--use_wandb', action='store_true',
@@ -80,6 +79,7 @@ def train(args, model, train_loader, dev_loader, optimizer, scheduler):
                 'dev/sql_em' : sql_em,
                 'dev/error_rate' : error_rate,
             }
+            import wandb
             wandb.log(result_dict, step=epoch)
 
         if record_f1 > best_f1:
@@ -138,10 +138,27 @@ def eval_epoch(args, model, dev_loader, gt_sql_pth, model_sql_path, gt_record_pa
     should both provide good results. If you find that this component of evaluation takes too long with your compute,
     we found the cross-entropy loss (in the evaluation set) to be well (albeit imperfectly) correlated with F1 performance.
     '''
-    # TODO
     model.eval()
-    return 0, 0, 0, 0, 0
-        
+    predictions = []
+    total_loss = 0.0
+    total_tokens = 0
+    with torch.inference_mode():
+        for inputs, mask, decoder, targets, _ in tqdm(dev_loader):
+            inputs, mask = inputs.to(DEVICE), mask.to(DEVICE)
+            labels = targets.to(DEVICE).masked_fill(targets.to(DEVICE) == PAD_IDX, -100)
+            loss = model(input_ids=inputs, attention_mask=mask,
+                         decoder_input_ids=decoder.to(DEVICE), labels=labels).loss
+            count = labels.ne(-100).sum().item()
+            total_loss += loss.item() * count
+            total_tokens += count
+            sequences = model.generate(input_ids=inputs, attention_mask=mask,
+                                       max_new_tokens=512, num_beams=1, do_sample=False)
+            predictions.extend(get_tokenizer().batch_decode(sequences, skip_special_tokens=True))
+    save_queries_and_records(predictions, model_sql_path, model_record_path)
+    sql_em, record_em, f1, errors = compute_metrics(gt_sql_pth, model_sql_path,
+                                                    gt_record_path, model_record_path)
+    return total_loss / total_tokens, f1, record_em, sql_em, sum(map(bool, errors)) / len(errors)
+
 def test_inference(args, model, test_loader, model_sql_path, model_record_path):
     '''
     You must implement inference to compute your model's generated SQL queries and its associated 
