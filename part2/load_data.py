@@ -11,7 +11,10 @@ PAD_IDX = 0
 
 @lru_cache(maxsize=1)
 def get_tokenizer():
-    return T5TokenizerFast.from_pretrained("google-t5/t5-small")
+    tokenizer = T5TokenizerFast.from_pretrained("google-t5/t5-small")
+    # Keep multi-character SQLite operators intact during SentencePiece decoding.
+    tokenizer.add_tokens(["<", "<=", "<>"])
+    return tokenizer
 
 
 class T5Dataset(Dataset):
@@ -120,15 +123,19 @@ def token_statistics(lines, tokenizer):
     """Count text tokens before padding, truncation, or model-specific special tokens."""
     encoded = tokenizer(lines, add_special_tokens=False, padding=False,
                         truncation=False, return_attention_mask=False)
-    sequences = encoded["input_ids"]
+    return sequence_statistics(encoded["input_ids"])
+
+
+def sequence_statistics(sequences):
     vocabulary = {token for sequence in sequences for token in sequence}
-    return sum(map(len, sequences)) / len(lines), len(vocabulary)
+    return sum(map(len, sequences)) / len(sequences), len(vocabulary)
 
 
 def print_q4_statistics():
     data_dir = Path(__file__).resolve().parent / "data"
     tokenizer = T5TokenizerFast.from_pretrained("google-t5/t5-small")
     columns = []
+    processed_columns = []
     for split in ("train", "dev"):
         questions = load_lines(data_dir / f"{split}.nl")
         queries = load_lines(data_dir / f"{split}.sql")
@@ -138,12 +145,18 @@ def print_q4_statistics():
         sql_mean, sql_vocab = token_statistics(queries, tokenizer)
         columns.append((len(questions), f"{nl_mean:.2f}", f"{sql_mean:.2f}", nl_vocab, sql_vocab))
 
+        dataset = T5Dataset(data_dir, split)
+        # The final token is EOS; padding is added later by the collate function.
+        nl_mean, nl_vocab = sequence_statistics([ids[:-1] for ids in dataset.inputs])
+        sql_mean, sql_vocab = sequence_statistics([ids[:-1] for ids in dataset.targets])
+        processed_columns.append((f"{nl_mean:.2f}", f"{sql_mean:.2f}", nl_vocab, sql_vocab))
+
     labels = ("Number of examples", "Mean sentence length", "Mean SQL query length",
               "Vocabulary size (natural language)", "Vocabulary size (SQL)")
     rows = list(zip(labels, *columns))
-    # The baseline uses the original text with no additional preprocessing.
+    processed_rows = list(zip(labels[1:], *processed_columns))
     for title, table_rows in (("Table 1: Before preprocessing", rows),
-                              ("Table 2: After preprocessing (no additional changes)", rows[1:])):
+                              ("Table 2: After preprocessing (SQL operator tokens)", processed_rows)):
         print(title)
         print("| Statistic | Train | Dev |")
         print("|---|---:|---:|")

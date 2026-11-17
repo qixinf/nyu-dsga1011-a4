@@ -4,6 +4,7 @@ import torch
 
 import transformers
 from transformers import T5ForConditionalGeneration, T5Config
+from load_data import get_tokenizer
 from transformers.pytorch_utils import ALL_LAYERNORM_LAYERS
 
 DEVICE = torch.device('cuda') if torch.cuda.is_available() else torch.device('cpu')
@@ -21,8 +22,13 @@ def initialize_model(args):
     '''
     name = "google-t5/t5-small"
     if args.finetune:
-        return T5ForConditionalGeneration.from_pretrained(name).to(DEVICE)
-    return T5ForConditionalGeneration(T5Config.from_pretrained(name)).to(DEVICE)
+        model = T5ForConditionalGeneration.from_pretrained(name)
+    else:
+        model = T5ForConditionalGeneration(T5Config.from_pretrained(name))
+    # T5-small already has some spare embedding rows.
+    if len(get_tokenizer()) > model.get_input_embeddings().num_embeddings:
+        model.resize_token_embeddings(len(get_tokenizer()))
+    return model.to(DEVICE)
 
 def mkdir(dirpath):
     if not os.path.exists(dirpath):
@@ -32,7 +38,9 @@ def mkdir(dirpath):
             pass
 
 def save_model(checkpoint_dir, model, best):
-    model.save_pretrained(os.path.join(checkpoint_dir, "best" if best else "latest"))
+    path = os.path.join(checkpoint_dir, "best" if best else "latest")
+    model.save_pretrained(path)
+    get_tokenizer().save_pretrained(path)
 
 def load_model_from_checkpoint(args, best):
     kind = "ft" if args.finetune else "scr"
