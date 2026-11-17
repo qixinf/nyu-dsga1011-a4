@@ -140,6 +140,7 @@ def eval_epoch(args, model, dev_loader, gt_sql_pth, model_sql_path, gt_record_pa
     '''
     model.eval()
     predictions = []
+    tokenizer = getattr(args, "tokenizer", None) or get_tokenizer()
     total_loss = 0.0
     total_tokens = 0
     with torch.inference_mode():
@@ -152,8 +153,8 @@ def eval_epoch(args, model, dev_loader, gt_sql_pth, model_sql_path, gt_record_pa
             total_loss += loss.item() * count
             total_tokens += count
             sequences = model.generate(input_ids=inputs, attention_mask=mask,
-                                       max_new_tokens=512, num_beams=1, do_sample=False)
-            predictions.extend(get_tokenizer().batch_decode(sequences, skip_special_tokens=True))
+                                       max_new_tokens=512, num_beams=getattr(args, "num_beams", 1), do_sample=False)
+            predictions.extend(tokenizer.batch_decode(sequences, skip_special_tokens=True))
     save_queries_and_records(predictions, model_sql_path, model_record_path)
     sql_em, record_em, f1, errors = compute_metrics(gt_sql_pth, model_sql_path,
                                                     gt_record_path, model_record_path)
