@@ -24,9 +24,11 @@ def main():
         parser.error("Output already exists. Choose a new experiment_name.")
     args.tokenizer = T5TokenizerFast.from_pretrained(args.checkpoint)
     model = T5ForConditionalGeneration.from_pretrained(args.checkpoint).to(DEVICE)
-    dataset = T5Dataset("data", "dev")
-    # Encode using the exact tokenizer saved with this checkpoint.
-    dataset.inputs, dataset.targets = dataset.process_data("data", "dev", args.tokenizer)
+    dataset = T5Dataset(
+        "data", "dev", task_prefix=getattr(model.config, "task_prefix", ""),
+        schema_text=getattr(model.config, "schema_text", ""),
+        max_input_length=getattr(model.config, "max_input_length", 128),
+        tokenizer=args.tokenizer)
     loader = DataLoader(dataset, batch_size=args.batch_size, shuffle=False,
                         collate_fn=normal_collate_fn)
     sql_path.parent.mkdir(parents=True, exist_ok=True)

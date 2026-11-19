@@ -8,7 +8,7 @@ import numpy as np
 
 from t5_utils import initialize_model, initialize_optimizer_and_scheduler, save_model, load_model_from_checkpoint, setup_wandb
 from load_data import get_tokenizer
-from load_data import load_t5_data
+from load_data import load_t5_data, compact_schema
 from utils import compute_metrics, save_queries_and_records
 
 DEVICE = torch.device('cuda') if torch.cuda.is_available() else torch.device('cpu')
@@ -43,11 +43,21 @@ def get_args():
     parser.add_argument('--experiment_name', type=str, default='experiment',
                         help="How should we name this experiment?")
 
+    parser.add_argument("--task_prefix", default="", help="Prefix added to every natural language input.")
+
+    parser.add_argument("--run_test", action="store_true", help="Also generate test outputs after training.")
+
     # Data hyperparameters
     parser.add_argument('--batch_size', type=int, default=16)
     parser.add_argument('--test_batch_size', type=int, default=16)
 
+    parser.add_argument("--use_schema", action="store_true", help="Append compact table/column schema to each question.")
+    parser.add_argument("--max_input_length", type=int, default=None)
     args = parser.parse_args()
+    if args.max_input_length is None:
+        args.max_input_length = 2048 if args.use_schema else 128
+    if args.max_input_length < 1:
+        parser.error("max_input_length must be positive")
     return args
 
 def train(args, model, train_loader, dev_loader, optimizer, scheduler):
@@ -165,7 +175,24 @@ def test_inference(args, model, test_loader, model_sql_path, model_record_path):
     You must implement inference to compute your model's generated SQL queries and its associated 
     database records. Implementation should be very similar to eval_epoch.
     '''
-    pass
+    model.eval()
+    tokenizer = getattr(args, "tokenizer", None) or get_tokenizer()
+    predictions = []
+    with torch.inference_mode():
+        for encoder_input, encoder_mask, _ in tqdm(test_loader):
+            sequences = model.generate(
+                input_ids=encoder_input.to(DEVICE),
+                attention_mask=encoder_mask.to(DEVICE),
+                max_new_tokens=512,
+                num_beams=getattr(args, "num_beams", 1),
+                do_sample=False,
+            )
+            predictions.extend(tokenizer.batch_decode(sequences, skip_special_tokens=True))
+    if len(predictions) != len(test_loader.dataset):
+        raise ValueError("Prediction count does not match the test dataset.")
+    save_queries_and_records(predictions, model_sql_path, model_record_path)
+    print(f"Saved {len(predictions)} predictions to {model_sql_path} and {model_record_path}")
+
 
 def main():
     # Get key arguments
@@ -175,7 +202,10 @@ def main():
         setup_wandb(args)
 
     # Load the data and the model
-    train_loader, dev_loader, test_loader = load_t5_data(args.batch_size, args.test_batch_size)
+    args.schema_text = compact_schema("data") if args.use_schema else ""
+    train_loader, dev_loader, test_loader = load_t5_data(
+        args.batch_size, args.test_batch_size, task_prefix=args.task_prefix,
+        schema_text=args.schema_text, max_input_length=args.max_input_length)
     model = initialize_model(args)
     optimizer, scheduler = initialize_optimizer_and_scheduler(args, model, len(train_loader))
 
@@ -202,7 +232,8 @@ def main():
     # Test set
     model_sql_path = os.path.join(f'results/t5_{model_type}_{experiment_name}_test.sql')
     model_record_path = os.path.join(f'records/t5_{model_type}_{experiment_name}_test.pkl')
-    test_inference(args, model, test_loader, model_sql_path, model_record_path)
+    if args.run_test:
+        test_inference(args, model, test_loader, model_sql_path, model_record_path)
 
 if __name__ == "__main__":
     main()

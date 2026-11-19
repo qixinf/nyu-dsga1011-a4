@@ -28,6 +28,9 @@ def initialize_model(args):
     # T5-small already has some spare embedding rows.
     if len(get_tokenizer()) > model.get_input_embeddings().num_embeddings:
         model.resize_token_embeddings(len(get_tokenizer()))
+    model.config.task_prefix = getattr(args, "task_prefix", "")
+    model.config.schema_text = getattr(args, "schema_text", "")
+    model.config.max_input_length = getattr(args, "max_input_length", 128)
     return model.to(DEVICE)
 
 def mkdir(dirpath):

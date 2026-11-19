@@ -1,6 +1,8 @@
 from functools import lru_cache
 from pathlib import Path
 
+import sqlite3
+
 import torch
 from torch.utils.data import Dataset, DataLoader
 from torch.nn.utils.rnn import pad_sequence
@@ -17,9 +19,26 @@ def get_tokenizer():
     return tokenizer
 
 
+def compact_schema(data_folder="data"):
+    """Read only table/column metadata; never inspect SQL labels or row values."""
+    path = (Path(data_folder) / "flight_database.db").resolve()
+    with sqlite3.connect(path.as_uri() + "?mode=ro", uri=True) as conn:
+        tables = [row[0] for row in conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' "
+            "AND name NOT LIKE 'sqlite_%' ORDER BY name")]
+        parts = []
+        for table in tables:
+            quoted = table.replace('"', '""')
+            columns = [row[1] for row in conn.execute(f'PRAGMA table_info("{quoted}")')]
+            parts.append(f"{table}({', '.join(columns)})")
+    if not parts:
+        raise ValueError("No tables found in schema database")
+    return "; ".join(parts)
+
+
 class T5Dataset(Dataset):
 
-    def __init__(self, data_folder, split):
+    def __init__(self, data_folder, split, task_prefix="", schema_text="", max_input_length=128, tokenizer=None):
         '''
         Skeleton for the class for performing data processing for the T5 model.
 
@@ -30,12 +49,27 @@ class T5Dataset(Dataset):
               T5Tokenizer should serve that purpose.
             * Class behavior should be different on the test set.
         '''
-        self.inputs, self.targets = self.process_data(data_folder, split, get_tokenizer())
+        self.task_prefix = task_prefix
+        self.schema_text = schema_text
+        self.max_input_length = max_input_length
+        if max_input_length < 1:
+            raise ValueError("max_input_length must be positive")
+        self.inputs, self.targets = self.process_data(data_folder, split, tokenizer or get_tokenizer())
 
     def process_data(self, data_folder, split, tokenizer):
         folder = Path(data_folder)
         questions = load_lines(folder / f"{split}.nl")
-        inputs = tokenizer(questions, max_length=128, truncation=True).input_ids
+        questions = [self.task_prefix + question for question in questions]
+        if self.schema_text:
+            questions = [f"question: {question}\nschema: {self.schema_text}" for question in questions]
+            inputs = tokenizer(questions, truncation=False).input_ids
+            longest = max(map(len, inputs), default=0)
+            print(f"{split}: schema input tokens max={longest}, limit={self.max_input_length}")
+            if longest > self.max_input_length:
+                raise ValueError(f"Schema input needs {longest} tokens; increase --max_input_length "
+                                 f"from {self.max_input_length}. Refusing to truncate schema.")
+        else:
+            inputs = tokenizer(questions, max_length=self.max_input_length, truncation=True).input_ids
         if split == "test":
             return inputs, None
         queries = load_lines(folder / f"{split}.sql")
@@ -92,19 +126,19 @@ def test_collate_fn(batch):
     return encoder_ids, encoder_mask, initial_decoder_inputs
 
 
-def get_dataloader(batch_size, split):
+def get_dataloader(batch_size, split, task_prefix="", **input_options):
     data_folder = 'data'
-    dset = T5Dataset(data_folder, split)
+    dset = T5Dataset(data_folder, split, task_prefix=task_prefix, **input_options)
     shuffle = split == "train"
     collate_fn = normal_collate_fn if split != "test" else test_collate_fn
 
     dataloader = DataLoader(dset, batch_size=batch_size, shuffle=shuffle, collate_fn=collate_fn)
     return dataloader
 
-def load_t5_data(batch_size, test_batch_size):
-    train_loader = get_dataloader(batch_size, "train")
-    dev_loader = get_dataloader(test_batch_size, "dev")
-    test_loader = get_dataloader(test_batch_size, "test")
+def load_t5_data(batch_size, test_batch_size, task_prefix="", **input_options):
+    train_loader = get_dataloader(batch_size, "train", task_prefix=task_prefix, **input_options)
+    dev_loader = get_dataloader(test_batch_size, "dev", task_prefix=task_prefix, **input_options)
+    test_loader = get_dataloader(test_batch_size, "test", task_prefix=task_prefix, **input_options)
     
     return train_loader, dev_loader, test_loader
 
@@ -131,9 +165,22 @@ def sequence_statistics(sequences):
     return sum(map(len, sequences)) / len(sequences), len(vocabulary)
 
 
-def print_q4_statistics():
+def print_q4_statistics(task_prefix="", checkpoint=None):
     data_dir = Path(__file__).resolve().parent / "data"
     tokenizer = T5TokenizerFast.from_pretrained("google-t5/t5-small")
+    schema_text = ""
+    max_input_length = 128
+    processed_tokenizer = get_tokenizer()
+    if checkpoint is not None:
+        import json
+        checkpoint = Path(checkpoint)
+        config = json.loads((checkpoint / "config.json").read_text())
+        task_prefix = config.get("task_prefix", "")
+        schema_text = config.get("schema_text", "")
+        max_input_length = config.get("max_input_length", 128)
+        processed_tokenizer = T5TokenizerFast.from_pretrained(checkpoint)
+    print(f"Preprocessing: schema={bool(schema_text)}, max_input_length={max_input_length}, "
+          f"task_prefix={task_prefix!r}")
     columns = []
     processed_columns = []
     for split in ("train", "dev"):
@@ -145,7 +192,9 @@ def print_q4_statistics():
         sql_mean, sql_vocab = token_statistics(queries, tokenizer)
         columns.append((len(questions), f"{nl_mean:.2f}", f"{sql_mean:.2f}", nl_vocab, sql_vocab))
 
-        dataset = T5Dataset(data_dir, split)
+        dataset = T5Dataset(
+            data_dir, split, task_prefix=task_prefix, schema_text=schema_text,
+            max_input_length=max_input_length, tokenizer=processed_tokenizer)
         # The final token is EOS; padding is added later by the collate function.
         nl_mean, nl_vocab = sequence_statistics([ids[:-1] for ids in dataset.inputs])
         sql_mean, sql_vocab = sequence_statistics([ids[:-1] for ids in dataset.targets])
@@ -156,7 +205,7 @@ def print_q4_statistics():
     rows = list(zip(labels, *columns))
     processed_rows = list(zip(labels[1:], *processed_columns))
     for title, table_rows in (("Table 1: Before preprocessing", rows),
-                              ("Table 2: After preprocessing (SQL operator tokens)", processed_rows)):
+                              ("Table 2: After preprocessing (actual encoder inputs and SQL targets)", processed_rows)):
         print(title)
         print("| Statistic | Train | Dev |")
         print("|---|---:|---:|")
@@ -166,5 +215,11 @@ def print_q4_statistics():
 
 
 if __name__ == "__main__":
-    print_q4_statistics()
+    import argparse
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--task_prefix", default="")
+    parser.add_argument("--checkpoint", type=Path,
+                        help="Use the tokenizer and input settings saved with the final model.")
+    args = parser.parse_args()
+    print_q4_statistics(args.task_prefix, args.checkpoint)
     raise SystemExit(0)
